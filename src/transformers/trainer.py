@@ -963,6 +963,7 @@ class Trainer:
 
         Subclass and override this method if you want to inject some custom behavior.
         """
+        print('get_train_dataloader starting')
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
@@ -986,6 +987,12 @@ class Trainer:
             dataloader_params["drop_last"] = self.args.dataloader_drop_last
             dataloader_params["worker_init_fn"] = seed_worker
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+
+        print(type(train_dataset))
+        if isinstance(train_dataset, dict):
+            print('get_train_dataloader isinstance dict')
+        if isinstance(train_dataset, datasets.DatasetDict):
+            print('get_train_dataloader isinstance datasets.DatasetDict')
 
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
