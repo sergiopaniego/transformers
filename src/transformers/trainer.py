@@ -53,7 +53,7 @@ import torch.distributed as dist
 from huggingface_hub import ModelCard, create_repo, upload_folder
 from packaging import version
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, IterableDataset, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, Dataset, IterableDataset, RandomSampler, SequentialSampler, ConcatDataset, BatchSampler, SubsetRandomSampler
 
 from . import __version__
 from .configuration_utils import PretrainedConfig
@@ -179,6 +179,17 @@ from .utils import (
 )
 from .utils.deprecation import deprecate_kwarg
 from .utils.quantization_config import QuantizationMethod
+from .training_args import (
+    BatchSamplers,
+    MultiDatasetBatchSamplers,
+)
+from .sampler import (
+    DefaultBatchSampler,
+    GroupByLabelBatchSampler,
+    NoDuplicatesBatchSampler,
+    ProportionalBatchSampler,
+    RoundRobinBatchSampler,
+)
 
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
@@ -954,6 +965,102 @@ class Trainer:
 
         else:
             return RandomSampler(self.train_dataset)
+        
+    def get_batch_sampler(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        drop_last: bool,
+        valid_label_columns: Optional[List[str]] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> Optional[BatchSampler]:
+        """
+        Returns the appropriate batch sampler based on the ``batch_sampler`` argument in ``self.args``.
+        This batch sampler class supports ``__len__`` and ``__iter__`` methods, and is used as the ``batch_sampler``
+        to create the :class:`torch.utils.data.DataLoader`.
+
+        .. note::
+            Override this method to provide a custom batch sampler.
+
+        Args:
+            dataset (Dataset): The dataset to sample from.
+            batch_size (int): Number of samples per batch.
+            drop_last (bool): If True, drop the last incomplete batch if the dataset size
+                is not divisible by the batch size.
+            valid_label_columns (List[str]): List of column names to check for labels.
+                The first column name from ``valid_label_columns`` found in the dataset will
+                be used as the label column.
+            generator (torch.Generator, optional): Optional random number generator for shuffling
+                the indices.
+        """
+        self.args.batch_sampler = BatchSamplers.BATCH_SAMPLER
+        if isinstance(dataset, IterableDataset):
+            if self.args.batch_sampler != BatchSamplers.BATCH_SAMPLER:
+                logger.warning("When using an IterableDataset, you cannot specify a batch sampler.")
+            return None
+
+        if self.args.batch_sampler == BatchSamplers.NO_DUPLICATES:
+            return NoDuplicatesBatchSampler(
+                dataset=dataset,
+                batch_size=batch_size,
+                drop_last=drop_last,
+                valid_label_columns=valid_label_columns,
+                generator=generator,
+            )
+
+        if self.args.batch_sampler == BatchSamplers.GROUP_BY_LABEL:
+            return GroupByLabelBatchSampler(
+                dataset=dataset,
+                batch_size=batch_size,
+                drop_last=drop_last,
+                valid_label_columns=valid_label_columns,
+            )
+
+        if self.args.batch_sampler == BatchSamplers.BATCH_SAMPLER:
+            return DefaultBatchSampler(
+                SubsetRandomSampler(range(len(dataset)), generator=generator),
+                batch_size=batch_size,
+                drop_last=drop_last,
+            )
+
+    def get_multi_dataset_batch_sampler(
+        self,
+        dataset: ConcatDataset,
+        batch_samplers: List[BatchSampler],
+        generator: Optional[torch.Generator] = None,
+        seed: Optional[int] = 0,
+    ) -> BatchSampler:
+        """
+        Returns the appropriate multi-dataset batch sampler based on the ``multi_dataset_batch_sampler`` argument
+        in ``self.args``. This batch sampler class supports ``__len__`` and ``__iter__`` methods, and is used as the
+        ``batch_sampler`` to create the :class:`torch.utils.data.DataLoader`.
+
+        .. note::
+            Override this method to provide a custom multi-dataset batch sampler.
+
+        Args:
+            dataset (ConcatDataset): The concatenation of all datasets.
+            batch_samplers (List[BatchSampler]): List of batch samplers for each dataset in the concatenated dataset.
+            generator (torch.Generator, optional): Optional random number generator for shuffling the indices.
+            seed (int, optional): Optional seed for the random number generator
+        """
+        self.args.multi_dataset_batch_sampler = MultiDatasetBatchSamplers.PROPORTIONAL
+        if self.args.multi_dataset_batch_sampler == MultiDatasetBatchSamplers.ROUND_ROBIN:
+            return RoundRobinBatchSampler(
+                dataset=dataset,
+                batch_samplers=batch_samplers,
+                generator=generator,
+                seed=seed,
+            )
+
+        if self.args.multi_dataset_batch_sampler == MultiDatasetBatchSamplers.PROPORTIONAL:
+            return ProportionalBatchSampler(
+                dataset=dataset,
+                batch_samplers=batch_samplers,
+                generator=generator,
+                seed=seed,
+            )
+
 
     def get_train_dataloader(self) -> DataLoader:
         """
@@ -975,26 +1082,72 @@ class Trainer:
         else:
             data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
 
+        generator = torch.Generator()
+        if self.args.seed:
+            generator.manual_seed(self.args.seed)
+
         dataloader_params = {
-            "batch_size": self._train_batch_size,
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
             "persistent_workers": self.args.dataloader_persistent_workers,
+            "prefetch_factor": self.args.dataloader_prefetch_factor,
         }
 
-        if not isinstance(train_dataset, torch.utils.data.IterableDataset):
-            dataloader_params["sampler"] = self._get_train_sampler()
-            dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            dataloader_params["worker_init_fn"] = seed_worker
-            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+        if isinstance(train_dataset, IterableDataset):
+            dataloader_params.update(
+                {
+                    "sampler": self._get_train_sampler(),
+                    "batch_size": self.args.train_batch_size,
+                    "drop_last": self.args.dataloader_drop_last,
+                }
+            )
+            if self.args.batch_sampler != BatchSamplers.BATCH_SAMPLER:
+                logger.warning("When using an IterableDataset, you cannot specify a batch sampler.")
+
+        elif isinstance(train_dataset, datasets.IterableDatasetDict):
+            raise ValueError(
+                "Transformers is not compatible with IterableDatasetDict. Please use a DatasetDict instead."
+            )
 
         print(type(train_dataset))
         if isinstance(train_dataset, dict):
             print('get_train_dataloader isinstance dict')
         if isinstance(train_dataset, datasets.DatasetDict):
-            print('get_train_dataloader isinstance datasets.DatasetDict')
+            for dataset in train_dataset.values():
+                print(type(dataset))
+                if isinstance(dataset, IterableDataset):
+                    raise ValueError(
+                        "Transformers is not compatible with a DatasetDict containing an IterableDataset."
+                    )
+            
+            batch_samplers = [
+                self.get_batch_sampler(
+                    dataset,
+                    batch_size=self.args.train_batch_size,
+                    drop_last=self.args.dataloader_drop_last,
+                    #valid_label_columns=data_collator.valid_label_columns,
+                    generator=generator,
+                )
+                for dataset in train_dataset.values()
+            ]
+            
+            train_dataset = ConcatDataset(train_dataset.values())
+            batch_sampler = self.get_multi_dataset_batch_sampler(
+                dataset=train_dataset,
+                batch_samplers=batch_samplers,
+                generator=generator,
+                seed=self.args.seed,
+            )
+            dataloader_params["batch_sampler"] = batch_sampler
+         
 
+        # If 'even_batches' is True, it will use the initial few samples to pad out the last sample. This can
+        # cause issues with multi-dataset training, so we want to set this to False.
+        # For evaluation, setting 'even_batches' to False results in hanging, so we keep it as True there.
+        self.accelerator.even_batches = False
+        self._train_dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
+        print(self._train_dataloader)
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
     def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.Sampler]:
