@@ -1676,17 +1676,11 @@ class TrainingArguments:
             "https://github.com/huggingface/transformers/issues/34242"
         },
     )
-    '''
-    batch_sampler: BatchSamplers | str = field(
-        default=BatchSamplers.BATCH_SAMPLER, metadata={"help": "The batch sampler to use."}
-    )
-    multi_dataset_batch_sampler: MultiDatasetBatchSamplers | str = field(
-        default=MultiDatasetBatchSamplers.PROPORTIONAL, metadata={"help": "The multi-dataset batch sampler to use."}
-    )
-    '''
+    
     batch_sampler: Union[BatchSamplers, str] = field(
         default=BatchSamplers.BATCH_SAMPLER, metadata={"help": "The batch sampler to use."}
     )
+
     multi_dataset_batch_sampler: Union[MultiDatasetBatchSamplers, str] = field(
         default=MultiDatasetBatchSamplers.PROPORTIONAL, metadata={"help": "The multi-dataset batch sampler to use."}
     )
