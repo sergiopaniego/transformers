@@ -585,6 +585,10 @@ class Trainer:
             else default_data_collator
         )
         self.data_collator = data_collator if data_collator is not None else default_collator
+        if isinstance(train_dataset, dict) and not isinstance(train_dataset, datasets.DatasetDict):
+            train_dataset = datasets.DatasetDict(train_dataset)
+        if isinstance(eval_dataset, dict) and not isinstance(eval_dataset, datasets.DatasetDict):
+            eval_dataset = datasets.DatasetDict(eval_dataset)
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.processing_class = processing_class
